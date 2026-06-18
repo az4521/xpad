@@ -150,6 +150,10 @@ static bool auto_poweroff = true;
 module_param(auto_poweroff, bool, S_IWUSR | S_IRUGO);
 MODULE_PARM_DESC(auto_poweroff, "Power off wireless controllers on suspend");
 
+static bool chatpad = true;
+module_param(chatpad, bool, S_IRUGO);
+MODULE_PARM_DESC(chatpad, "Enable Xbox 360 chatpad keyboard accessory support");
+
 static const struct xpad_device {
 	u16 idVendor;
 	u16 idProduct;
@@ -496,6 +500,53 @@ static const signed short xpad_btn_paddles[] = {
 	-1						/* terminating entry */
 };
 
+/*
+ * Xbox 360 Chatpad
+ *
+ * The chatpad is a small QWERTY keyboard accessory that clips onto the
+ * controller. On wired controllers it is exposed on a dedicated, vendor
+ * specific USB interface; on wireless controllers its key reports are
+ * interleaved into the normal wireless data stream. In both cases the
+ * controller has to be told to enable the chatpad and then kept awake with
+ * periodic keep-alive messages.
+ *
+ * The magic numbers below were reverse-engineered by the xboxdrv project.
+ */
+
+/* Chatpad modifier bit flags as reported by the hardware */
+#define CHATPAD_MOD_SHIFT	0x01
+#define CHATPAD_MOD_GREEN	0x02
+#define CHATPAD_MOD_ORANGE	0x04
+#define CHATPAD_MOD_PEOPLE	0x08
+
+/* Interval between chatpad keep-alive messages, in msecs */
+#define CHATPAD_KEEPALIVE_INTERVAL 1000
+
+/*
+ * Translation from the chatpad's vendor specific scancodes to Linux input
+ * keycodes. The largest scancode is 0x77, so a 128 entry table is enough.
+ * Scancodes that are not mapped translate to KEY_RESERVED and are ignored.
+ */
+static const unsigned short xpad_chatpad_keycodes[128] = {
+	[0x17] = KEY_1,		[0x16] = KEY_2,		[0x15] = KEY_3,
+	[0x14] = KEY_4,		[0x13] = KEY_5,		[0x12] = KEY_6,
+	[0x11] = KEY_7,		[0x67] = KEY_8,		[0x66] = KEY_9,
+	[0x65] = KEY_0,
+	[0x27] = KEY_Q,		[0x26] = KEY_W,		[0x25] = KEY_E,
+	[0x24] = KEY_R,		[0x23] = KEY_T,		[0x22] = KEY_Y,
+	[0x21] = KEY_U,		[0x76] = KEY_I,		[0x75] = KEY_O,
+	[0x64] = KEY_P,
+	[0x37] = KEY_A,		[0x36] = KEY_S,		[0x35] = KEY_D,
+	[0x34] = KEY_F,		[0x33] = KEY_G,		[0x32] = KEY_H,
+	[0x31] = KEY_J,		[0x77] = KEY_K,		[0x72] = KEY_L,
+	[0x46] = KEY_Z,		[0x45] = KEY_X,		[0x44] = KEY_C,
+	[0x43] = KEY_V,		[0x42] = KEY_B,		[0x41] = KEY_N,
+	[0x52] = KEY_M,
+	[0x62] = KEY_COMMA,	[0x53] = KEY_DOT,	[0x63] = KEY_ENTER,
+	[0x71] = KEY_BACKSPACE,	[0x54] = KEY_SPACE,	[0x55] = KEY_LEFT,
+	[0x51] = KEY_RIGHT,
+};
+
 /* used for GHL dpad mapping */
 static const struct {int x; int y; } dpad_mapping[] = {
 	{0, -1}, {1, -1}, {1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1},
@@ -821,12 +872,32 @@ struct usb_xpad {
 	time64_t mode_btn_down_ts;
 	struct urb *ghl_urb;		/* URB for GHL Xbox One magic data */
 	struct timer_list ghl_poke_timer;	/* Timer for periodic poke of GHL magic data */
+
+	/* Xbox 360 chatpad keyboard accessory */
+	bool chatpad;			/* chatpad support enabled for this device */
+	struct usb_interface *chatpad_intf;	/* claimed wired chatpad interface */
+	struct input_dev *chatpad_dev;	/* chatpad keyboard input device */
+	struct urb *chatpad_irq_in;	/* urb for wired chatpad input report */
+	unsigned char *chatpad_idata;	/* wired chatpad input data */
+	dma_addr_t chatpad_idata_dma;
+	struct delayed_work chatpad_keepalive;	/* periodic chatpad keep-alive */
+	bool chatpad_keepalive_toggle;	/* wired: alternate 0x1f / 0x1e */
+	u8 chatpad_laststroke[3];	/* last reported [modifier, key1, key2] */
+	struct work_struct chatpad_led_work;	/* sync wired modifier LEDs */
+	u8 chatpad_led_state;		/* modifier LED bits currently in hw */
+	u8 chatpad_led_target;		/* desired modifier LED bits */
+	char chatpad_name[128];		/* chatpad input device name */
+	char chatpad_phys[64];		/* chatpad physical device path */
 };
 
 static int xpad_init_input(struct usb_xpad *xpad);
 static void xpad_deinit_input(struct usb_xpad *xpad);
 static void xpadone_ack_mode_report(struct usb_xpad *xpad, u8 seq_num);
 static void xpad360w_poweroff_controller(struct usb_xpad *xpad);
+static struct usb_driver xpad_driver;
+static int xpad_chatpad_init_input(struct usb_xpad *xpad);
+static void xpad_chatpad_deinit_input(struct usb_xpad *xpad);
+static void xpad360w_chatpad_process(struct usb_xpad *xpad, unsigned char *data);
 
 /*
  *	ghl_magic_poke_cb
@@ -1076,6 +1147,14 @@ static void xpad_presence_work(struct work_struct *work)
 			dev_err(&xpad->dev->dev,
 				"unable to init device: %d\n", error);
 		} else {
+			/*
+			 * Create the chatpad keyboard before publishing the
+			 * gamepad so that, once x360w_dev is visible, the
+			 * chatpad input device is guaranteed to be present for
+			 * xpad360w_process_packet.
+			 */
+			if (xpad->chatpad)
+				xpad_chatpad_init_input(xpad);
 			rcu_assign_pointer(xpad->x360w_dev, xpad->dev);
 		}
 	} else {
@@ -1085,6 +1164,8 @@ static void xpad_presence_work(struct work_struct *work)
 		 * Now that we are sure xpad360w_process_packet is not
 		 * using input device we can get rid of it.
 		 */
+		if (xpad->chatpad)
+			xpad_chatpad_deinit_input(xpad);
 		xpad_deinit_input(xpad);
 	}
 }
@@ -1116,6 +1197,20 @@ static void xpad360w_process_packet(struct usb_xpad *xpad, u16 cmd, unsigned cha
 			xpad->pad_present = present;
 			schedule_work(&xpad->work);
 		}
+	}
+
+	/*
+	 * Chatpad keystrokes arrive interleaved with the normal data stream.
+	 * They are gated on x360w_dev being live so that the chatpad input
+	 * device (created just before x360w_dev is published) is valid here.
+	 */
+	if (xpad->chatpad && data[0] == 0x00 && data[1] == 0x02 &&
+	    data[2] == 0x00 && data[3] == 0xf0) {
+		rcu_read_lock();
+		if (rcu_dereference(xpad->x360w_dev))
+			xpad360w_chatpad_process(xpad, data);
+		rcu_read_unlock();
+		return;
 	}
 
 	/* Valid pad data */
@@ -2207,6 +2302,500 @@ static void xpad_deinit_input(struct usb_xpad *xpad)
 	}
 }
 
+/*
+ *	xpad_chatpad_set_led
+ *
+ *	Turns one of the wired chatpad's modifier backlight LEDs on or off via
+ *	a control transfer. Must be called from a sleepable context.
+ */
+static void xpad_chatpad_set_led(struct usb_xpad *xpad, u8 mod, bool on)
+{
+	u16 value;
+
+	switch (mod) {
+	case CHATPAD_MOD_SHIFT:
+		value = on ? 0x0008 : 0x0000;
+		break;
+	case CHATPAD_MOD_GREEN:
+		value = on ? 0x0009 : 0x0001;
+		break;
+	case CHATPAD_MOD_ORANGE:
+		value = on ? 0x000a : 0x0002;
+		break;
+	case CHATPAD_MOD_PEOPLE:
+		value = on ? 0x000b : 0x0003;
+		break;
+	default:
+		return;
+	}
+
+	usb_control_msg_send(xpad->udev, 0, 0x00, 0x41, value, 0x0002,
+			     NULL, 0, 100, GFP_KERNEL);
+}
+
+/*
+ *	xpad_chatpad_led_work
+ *
+ *	The modifier LEDs are driven by control transfers, which cannot be
+ *	issued from the URB completion handler that detects key state changes.
+ *	This work brings the hardware LEDs in line with the requested state.
+ */
+static void xpad_chatpad_led_work(struct work_struct *work)
+{
+	struct usb_xpad *xpad =
+		container_of(work, struct usb_xpad, chatpad_led_work);
+	u8 target, changed;
+
+	do {
+		target = READ_ONCE(xpad->chatpad_led_target);
+		changed = target ^ xpad->chatpad_led_state;
+
+		if (changed & CHATPAD_MOD_SHIFT)
+			xpad_chatpad_set_led(xpad, CHATPAD_MOD_SHIFT,
+					     target & CHATPAD_MOD_SHIFT);
+		if (changed & CHATPAD_MOD_GREEN)
+			xpad_chatpad_set_led(xpad, CHATPAD_MOD_GREEN,
+					     target & CHATPAD_MOD_GREEN);
+		if (changed & CHATPAD_MOD_ORANGE)
+			xpad_chatpad_set_led(xpad, CHATPAD_MOD_ORANGE,
+					     target & CHATPAD_MOD_ORANGE);
+		if (changed & CHATPAD_MOD_PEOPLE)
+			xpad_chatpad_set_led(xpad, CHATPAD_MOD_PEOPLE,
+					     target & CHATPAD_MOD_PEOPLE);
+
+		xpad->chatpad_led_state = target;
+	} while (target != READ_ONCE(xpad->chatpad_led_target));
+}
+
+/*
+ *	xpad_chatpad_report_keys
+ *
+ *	Converts a chatpad key report ([modifier][key1][key2]) into input
+ *	events. The chatpad reports up to two simultaneous keys plus a set of
+ *	modifier flags; releases are detected by diffing against the previously
+ *	reported state. Shared by the wired and wireless code paths.
+ */
+static void xpad_chatpad_report_keys(struct usb_xpad *xpad,
+				     u8 modifier, u8 key1, u8 key2)
+{
+	struct input_dev *dev = xpad->chatpad_dev;
+	u8 *last = xpad->chatpad_laststroke;
+	u8 changed = modifier ^ last[0];
+
+	if (!dev)
+		return;
+
+	/*
+	 * Mirror the modifier keys on the wired chatpad's backlight LEDs.
+	 * The actual LED commands are control transfers, so they are deferred
+	 * to a work item (this runs in the URB completion handler).
+	 */
+	if (xpad->xtype == XTYPE_XBOX360 && (changed & 0x0f)) {
+		xpad->chatpad_led_target = modifier & 0x0f;
+		schedule_work(&xpad->chatpad_led_work);
+	}
+
+	if (changed & CHATPAD_MOD_SHIFT)
+		input_report_key(dev, KEY_LEFTSHIFT, modifier & CHATPAD_MOD_SHIFT);
+	if (changed & CHATPAD_MOD_GREEN)
+		input_report_key(dev, KEY_LEFTALT, modifier & CHATPAD_MOD_GREEN);
+	if (changed & CHATPAD_MOD_ORANGE)
+		input_report_key(dev, KEY_RIGHTALT, modifier & CHATPAD_MOD_ORANGE);
+	if (changed & CHATPAD_MOD_PEOPLE)
+		input_report_key(dev, KEY_LEFTMETA, modifier & CHATPAD_MOD_PEOPLE);
+
+	/* keys that were held but are no longer present have been released */
+	if (last[1] && last[1] != key1 && last[1] != key2)
+		input_report_key(dev, xpad_chatpad_keycodes[last[1] & 0x7f], 0);
+	if (last[2] && last[2] != key1 && last[2] != key2)
+		input_report_key(dev, xpad_chatpad_keycodes[last[2] & 0x7f], 0);
+
+	/* keys that are newly present have been pressed */
+	if (key1 && key1 != last[1] && key1 != last[2])
+		input_report_key(dev, xpad_chatpad_keycodes[key1 & 0x7f], 1);
+	if (key2 && key2 != last[1] && key2 != last[2])
+		input_report_key(dev, xpad_chatpad_keycodes[key2 & 0x7f], 1);
+
+	last[0] = modifier;
+	last[1] = key1;
+	last[2] = key2;
+	input_sync(dev);
+}
+
+/*
+ *	xpad_chatpad_wireless_send
+ *
+ *	Queues a chatpad command on the wireless controller's command OUT
+ *	endpoint. 0x1f enables/keeps the chatpad awake, 0x1b is sent to ack a
+ *	wake-up notification.
+ */
+static void xpad_chatpad_wireless_send(struct usb_xpad *xpad, u8 cmd)
+{
+	struct xpad_output_packet *packet =
+			&xpad->out_packets[XPAD_OUT_CMD_IDX];
+	unsigned long flags;
+
+	spin_lock_irqsave(&xpad->odata_lock, flags);
+
+	packet->data[0] = 0x00;
+	packet->data[1] = 0x00;
+	packet->data[2] = 0x0c;
+	packet->data[3] = cmd;
+	memset(&packet->data[4], 0, 8);
+	packet->len = 12;
+	packet->pending = true;
+
+	xpad_try_sending_next_out_packet(xpad);
+
+	spin_unlock_irqrestore(&xpad->odata_lock, flags);
+}
+
+/*
+ *	xpad360w_chatpad_process
+ *
+ *	Handles a wireless chatpad packet (header 00 02 00 f0). The payload at
+ *	offset 24 is either a status sub-packet (0xf0 ...) or a keystroke
+ *	(0x00 [modifier] [key1] [key2]).
+ */
+static void xpad360w_chatpad_process(struct usb_xpad *xpad, unsigned char *data)
+{
+	switch (data[24]) {
+	case 0xf0:
+		/* 0xf0 0x03 means the chatpad just woke up; ack it */
+		if (data[25] == 0x03) {
+			xpad->chatpad_laststroke[0] = 0;
+			xpad->chatpad_laststroke[1] = 0;
+			xpad->chatpad_laststroke[2] = 0;
+			xpad_chatpad_wireless_send(xpad, 0x1b);
+		}
+		break;
+	case 0x00:
+		xpad_chatpad_report_keys(xpad, data[25], data[26], data[27]);
+		break;
+	}
+}
+
+/*
+ *	xpad_chatpad_irq_in
+ *
+ *	Completion handler for the wired chatpad interrupt IN urb. Wired key
+ *	reports have the form [0x00][modifier][key1][key2].
+ */
+static void xpad_chatpad_irq_in(struct urb *urb)
+{
+	struct usb_xpad *xpad = urb->context;
+	struct device *dev = &xpad->intf->dev;
+	unsigned char *data = xpad->chatpad_idata;
+	int retval, status = urb->status;
+
+	switch (status) {
+	case 0:
+		break;
+	case -ECONNRESET:
+	case -ENOENT:
+	case -ESHUTDOWN:
+		/* this urb is terminated, clean up */
+		dev_dbg(dev, "%s - urb shutting down with status: %d\n",
+			__func__, status);
+		return;
+	default:
+		dev_dbg(dev, "%s - nonzero urb status received: %d\n",
+			__func__, status);
+		goto exit;
+	}
+
+	if (data[0] == 0x00)
+		xpad_chatpad_report_keys(xpad, data[1], data[2], data[3]);
+
+exit:
+	retval = usb_submit_urb(urb, GFP_ATOMIC);
+	if (retval)
+		dev_err(dev, "%s - usb_submit_urb failed with result %d\n",
+			__func__, retval);
+}
+
+/*
+ *	xpad_chatpad_send_init
+ *
+ *	Sends the magic control transfer handshake that enables the chatpad on
+ *	a wired controller. Values were reverse-engineered by xboxdrv and
+ *	differ slightly between the two known controller revisions.
+ */
+static int xpad_chatpad_send_init(struct usb_xpad *xpad)
+{
+	struct usb_device *udev = xpad->udev;
+	u8 code[2] = { 0x01, 0x02 };
+	int error;
+
+	if (le16_to_cpu(udev->descriptor.bcdDevice) == 0x0114) {
+		code[0] = 0x09;
+		code[1] = 0x00;
+	}
+
+	error = usb_control_msg_send(udev, 0, 0xa9, 0x40, 0xa30c, 0x4423,
+				     NULL, 0, 100, GFP_KERNEL);
+	if (error)
+		return error;
+	error = usb_control_msg_send(udev, 0, 0xa9, 0x40, 0x2344, 0x7f03,
+				     NULL, 0, 100, GFP_KERNEL);
+	if (error)
+		return error;
+	error = usb_control_msg_send(udev, 0, 0xa9, 0x40, 0x5839, 0x6832,
+				     NULL, 0, 100, GFP_KERNEL);
+	if (error)
+		return error;
+	error = usb_control_msg_recv(udev, 0, 0xa1, 0xc0, 0x0000, 0xe416,
+				     code, 2, 100, GFP_KERNEL);
+	if (error)
+		return error;
+	error = usb_control_msg_send(udev, 0, 0xa1, 0x40, 0x0000, 0xe416,
+				     code, 2, 100, GFP_KERNEL);
+	if (error)
+		return error;
+	error = usb_control_msg_recv(udev, 0, 0xa1, 0xc0, 0x0000, 0xe416,
+				     code, 2, 100, GFP_KERNEL);
+	if (error)
+		return error;
+
+	/* finally, enable the chatpad */
+	return usb_control_msg_send(udev, 0, 0x00, 0x41, 0x1b, 0x02,
+				    NULL, 0, 100, GFP_KERNEL);
+}
+
+/*
+ *	xpad_chatpad_keepalive_work
+ *
+ *	The chatpad falls asleep after a few seconds unless it is regularly
+ *	poked. Wired controllers expect alternating 0x1f / 0x1e control
+ *	transfers, wireless controllers expect a 0x1f command on the OUT
+ *	endpoint.
+ */
+static void xpad_chatpad_keepalive_work(struct work_struct *work)
+{
+	struct usb_xpad *xpad = container_of(to_delayed_work(work),
+					     struct usb_xpad, chatpad_keepalive);
+
+	if (xpad->xtype == XTYPE_XBOX360) {
+		u16 cmd = xpad->chatpad_keepalive_toggle ? 0x1e : 0x1f;
+
+		xpad->chatpad_keepalive_toggle = !xpad->chatpad_keepalive_toggle;
+		usb_control_msg_send(xpad->udev, 0, 0x00, 0x41, cmd, 0x02,
+				     NULL, 0, 100, GFP_KERNEL);
+	} else if (xpad->xtype == XTYPE_XBOX360W) {
+		xpad_chatpad_wireless_send(xpad, 0x1f);
+	}
+
+	schedule_delayed_work(&xpad->chatpad_keepalive,
+			      msecs_to_jiffies(CHATPAD_KEEPALIVE_INTERVAL));
+}
+
+/*
+ *	xpad_chatpad_init_input
+ *
+ *	Creates and registers the chatpad keyboard input device. For wireless
+ *	controllers this is called on controller arrival; for wired ones it is
+ *	called once at probe time.
+ */
+static int xpad_chatpad_init_input(struct usb_xpad *xpad)
+{
+	struct input_dev *input;
+	int i, error;
+
+	if (xpad->chatpad_dev)
+		return 0;
+
+	input = input_allocate_device();
+	if (!input)
+		return -ENOMEM;
+
+	input->name = xpad->chatpad_name;
+	input->phys = xpad->chatpad_phys;
+	usb_to_input_id(xpad->udev, &input->id);
+	input->dev.parent = &xpad->intf->dev;
+
+	for (i = 0; i < ARRAY_SIZE(xpad_chatpad_keycodes); i++)
+		if (xpad_chatpad_keycodes[i])
+			input_set_capability(input, EV_KEY,
+					     xpad_chatpad_keycodes[i]);
+
+	input_set_capability(input, EV_KEY, KEY_LEFTSHIFT);
+	input_set_capability(input, EV_KEY, KEY_LEFTALT);
+	input_set_capability(input, EV_KEY, KEY_RIGHTALT);
+	input_set_capability(input, EV_KEY, KEY_LEFTMETA);
+
+	error = input_register_device(input);
+	if (error) {
+		input_free_device(input);
+		return error;
+	}
+
+	memset(xpad->chatpad_laststroke, 0, sizeof(xpad->chatpad_laststroke));
+	xpad->chatpad_dev = input;
+	return 0;
+}
+
+static void xpad_chatpad_deinit_input(struct usb_xpad *xpad)
+{
+	if (xpad->chatpad_dev) {
+		input_unregister_device(xpad->chatpad_dev);
+		xpad->chatpad_dev = NULL;
+	}
+}
+
+/*
+ *	xpad_chatpad_init_wired
+ *
+ *	Claims the controller's dedicated chatpad interface, sets up its
+ *	interrupt IN urb, runs the enable handshake and starts listening for
+ *	key reports.
+ */
+static int xpad_chatpad_init_wired(struct usb_xpad *xpad)
+{
+	struct usb_device *udev = xpad->udev;
+	struct usb_interface *intf;
+	struct usb_host_interface *alt;
+	struct usb_endpoint_descriptor *ep_irq_in = NULL;
+	int i, error;
+
+	/* The chatpad is exposed on the controller's third interface */
+	intf = usb_ifnum_to_if(udev, 2);
+	if (!intf)
+		return -ENODEV;
+
+	error = usb_driver_claim_interface(&xpad_driver, intf, xpad);
+	if (error)
+		return error;
+	xpad->chatpad_intf = intf;
+
+	alt = intf->cur_altsetting;
+	for (i = 0; i < alt->desc.bNumEndpoints; i++) {
+		if (usb_endpoint_is_int_in(&alt->endpoint[i].desc)) {
+			ep_irq_in = &alt->endpoint[i].desc;
+			break;
+		}
+	}
+	if (!ep_irq_in) {
+		error = -ENODEV;
+		goto err_release;
+	}
+
+	xpad->chatpad_idata = usb_alloc_coherent(udev, XPAD_PKT_LEN, GFP_KERNEL,
+						 &xpad->chatpad_idata_dma);
+	if (!xpad->chatpad_idata) {
+		error = -ENOMEM;
+		goto err_release;
+	}
+
+	xpad->chatpad_irq_in = usb_alloc_urb(0, GFP_KERNEL);
+	if (!xpad->chatpad_irq_in) {
+		error = -ENOMEM;
+		goto err_free_idata;
+	}
+
+	usb_fill_int_urb(xpad->chatpad_irq_in, udev,
+			 usb_rcvintpipe(udev, ep_irq_in->bEndpointAddress),
+			 xpad->chatpad_idata, XPAD_PKT_LEN,
+			 xpad_chatpad_irq_in, xpad, ep_irq_in->bInterval);
+	xpad->chatpad_irq_in->transfer_dma = xpad->chatpad_idata_dma;
+	xpad->chatpad_irq_in->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+
+	error = xpad_chatpad_send_init(xpad);
+	if (error) {
+		dev_warn(&xpad->intf->dev,
+			 "could not initialise chatpad: %d\n", error);
+		goto err_free_urb;
+	}
+
+	error = usb_submit_urb(xpad->chatpad_irq_in, GFP_KERNEL);
+	if (error)
+		goto err_free_urb;
+
+	return 0;
+
+err_free_urb:
+	usb_free_urb(xpad->chatpad_irq_in);
+	xpad->chatpad_irq_in = NULL;
+err_free_idata:
+	usb_free_coherent(udev, XPAD_PKT_LEN, xpad->chatpad_idata,
+			  xpad->chatpad_idata_dma);
+	xpad->chatpad_idata = NULL;
+err_release:
+	usb_driver_release_interface(&xpad_driver, intf);
+	xpad->chatpad_intf = NULL;
+	return error;
+}
+
+static void xpad_chatpad_deinit_wired(struct usb_xpad *xpad)
+{
+	if (xpad->chatpad_irq_in) {
+		usb_kill_urb(xpad->chatpad_irq_in);
+		usb_free_urb(xpad->chatpad_irq_in);
+		xpad->chatpad_irq_in = NULL;
+	}
+	if (xpad->chatpad_idata) {
+		usb_free_coherent(xpad->udev, XPAD_PKT_LEN, xpad->chatpad_idata,
+				  xpad->chatpad_idata_dma);
+		xpad->chatpad_idata = NULL;
+	}
+	if (xpad->chatpad_intf) {
+		usb_driver_release_interface(&xpad_driver, xpad->chatpad_intf);
+		xpad->chatpad_intf = NULL;
+	}
+}
+
+/*
+ *	xpad_chatpad_start / xpad_chatpad_stop
+ *
+ *	Bring the chatpad up and down. Wireless chatpad input devices are
+ *	created on demand together with the controller (see
+ *	xpad_presence_work), so here we only set up the wired keyboard and the
+ *	keep-alive that applies to both transports.
+ */
+static int xpad_chatpad_start(struct usb_xpad *xpad)
+{
+	int error;
+
+	snprintf(xpad->chatpad_name, sizeof(xpad->chatpad_name),
+		 "%s Chatpad", xpad->name);
+	usb_make_path(xpad->udev, xpad->chatpad_phys,
+		      sizeof(xpad->chatpad_phys));
+	strlcat(xpad->chatpad_phys, "/input1", sizeof(xpad->chatpad_phys));
+
+	INIT_DELAYED_WORK(&xpad->chatpad_keepalive, xpad_chatpad_keepalive_work);
+	INIT_WORK(&xpad->chatpad_led_work, xpad_chatpad_led_work);
+
+	if (xpad->xtype == XTYPE_XBOX360) {
+		error = xpad_chatpad_init_input(xpad);
+		if (error)
+			return error;
+
+		error = xpad_chatpad_init_wired(xpad);
+		if (error) {
+			xpad_chatpad_deinit_input(xpad);
+			return error;
+		}
+	}
+
+	schedule_delayed_work(&xpad->chatpad_keepalive,
+			      msecs_to_jiffies(CHATPAD_KEEPALIVE_INTERVAL));
+	return 0;
+}
+
+static void xpad_chatpad_stop(struct usb_xpad *xpad)
+{
+	if (!xpad->chatpad)
+		return;
+
+	cancel_delayed_work_sync(&xpad->chatpad_keepalive);
+
+	if (xpad->xtype == XTYPE_XBOX360) {
+		cancel_work_sync(&xpad->chatpad_led_work);
+		xpad_chatpad_deinit_wired(xpad);
+	}
+
+	xpad_chatpad_deinit_input(xpad);
+}
+
 static int xpad_init_input(struct usb_xpad *xpad)
 {
 	struct input_dev *input_dev;
@@ -2497,6 +3086,26 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 		timer_setup(&xpad->ghl_poke_timer, ghl_magic_poke, 0);
 		mod_timer(&xpad->ghl_poke_timer, jiffies + GHL_GUITAR_POKE_INTERVAL*HZ);
 	}
+
+	/*
+	 * The chatpad is supported on the wired Microsoft Xbox 360 controller
+	 * (045e:028e) and on any wireless controller. Failing to bring it up
+	 * is not fatal: the gamepad keeps working without it.
+	 */
+	if (chatpad &&
+	    ((xpad->xtype == XTYPE_XBOX360 &&
+	      le16_to_cpu(udev->descriptor.idVendor) == 0x045e &&
+	      le16_to_cpu(udev->descriptor.idProduct) == 0x028e) ||
+	     xpad->xtype == XTYPE_XBOX360W)) {
+		xpad->chatpad = true;
+		error = xpad_chatpad_start(xpad);
+		if (error) {
+			xpad->chatpad = false;
+			dev_warn(&intf->dev,
+				 "could not enable chatpad support: %d\n", error);
+		}
+	}
+
 	return 0;
 
 err_deinit_output:
@@ -2514,8 +3123,24 @@ static void xpad_disconnect(struct usb_interface *intf)
 {
 	struct usb_xpad *xpad = usb_get_intfdata(intf);
 
+	if (!xpad)
+		return;
+
+	/*
+	 * For wired controllers we also claim the dedicated chatpad interface,
+	 * so disconnect() is invoked for it as well. All teardown is driven
+	 * from the primary (data) interface; for the chatpad interface we just
+	 * drop our reference so the primary path can free everything safely.
+	 */
+	if (intf == xpad->chatpad_intf) {
+		usb_set_intfdata(intf, NULL);
+		return;
+	}
+
 	if (xpad->xtype == XTYPE_XBOX360W)
 		xpad360w_stop_input(xpad);
+
+	xpad_chatpad_stop(xpad);
 
 	xpad_deinit_input(xpad);
 
@@ -2545,7 +3170,21 @@ static void xpad_disconnect(struct usb_interface *intf)
 static int xpad_suspend(struct usb_interface *intf, pm_message_t message)
 {
 	struct usb_xpad *xpad = usb_get_intfdata(intf);
-	struct input_dev *input = xpad->dev;
+	struct input_dev *input;
+
+	/* The chatpad interface is suspended together with the data interface */
+	if (!xpad || intf == xpad->chatpad_intf)
+		return 0;
+
+	input = xpad->dev;
+
+	if (xpad->chatpad) {
+		cancel_delayed_work_sync(&xpad->chatpad_keepalive);
+		if (xpad->xtype == XTYPE_XBOX360)
+			cancel_work_sync(&xpad->chatpad_led_work);
+		if (xpad->chatpad_irq_in)
+			usb_kill_urb(xpad->chatpad_irq_in);
+	}
 
 	if (xpad->xtype == XTYPE_XBOX360W) {
 		/*
@@ -2578,8 +3217,26 @@ static int xpad_suspend(struct usb_interface *intf, pm_message_t message)
 static int xpad_resume(struct usb_interface *intf)
 {
 	struct usb_xpad *xpad = usb_get_intfdata(intf);
-	struct input_dev *input = xpad->dev;
+	struct input_dev *input;
 	int retval = 0;
+
+	/* The chatpad interface is resumed together with the data interface */
+	if (!xpad || intf == xpad->chatpad_intf)
+		return 0;
+
+	input = xpad->dev;
+
+	if (xpad->chatpad) {
+		/* re-run the enable handshake; the controller may have reset */
+		if (xpad->chatpad_irq_in) {
+			xpad_chatpad_send_init(xpad);
+			usb_submit_urb(xpad->chatpad_irq_in, GFP_KERNEL);
+			/* hardware LEDs are off after a reset; re-sync lazily */
+			xpad->chatpad_led_state = 0;
+		}
+		schedule_delayed_work(&xpad->chatpad_keepalive,
+				      msecs_to_jiffies(CHATPAD_KEEPALIVE_INTERVAL));
+	}
 
 	if (xpad->xtype == XTYPE_XBOX360W) {
 		retval = xpad360w_start_input(xpad);

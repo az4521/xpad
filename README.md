@@ -8,6 +8,20 @@ This driver includes the latest changes in the upstream linux kernel and additio
 * support for more compatible devices
 * support for xbox360 class controllers, that need initialisation
 * support Guitar Hero Live xbox one controller
+* support for the Xbox 360 Chatpad keyboard accessory (wired and wireless)
+
+## Xbox 360 Chatpad
+The Chatpad is the small QWERTY keyboard that clips onto an Xbox 360 controller.
+When attached it shows up as an additional keyboard input device named
+"<controller> Chatpad" and reports normal key events. The green/orange/shift/
+people modifier keys are reported as Alt/AltGr/Shift/Meta respectively, so they
+can be remapped from userspace if desired.
+
+Chatpad support is enabled by default; it can be disabled with the `chatpad=0`
+module parameter:
+```
+options xpad chatpad=0
+```
 
 ## Xbox One Controllers
 This driver is only used if you connect the controller via USB.
