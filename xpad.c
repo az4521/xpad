@@ -547,6 +547,84 @@ static const unsigned short xpad_chatpad_keycodes[128] = {
 	[0x51] = KEY_RIGHT,
 };
 
+/*
+ * The green and orange modifier keys select alternate symbols printed on the
+ * keycaps. We translate those to the matching Linux keycode, synthesizing
+ * Shift for symbols that live on a shifted key (e.g. green Q '!' -> Shift+1).
+ *
+ * Entries are encoded as a keycode optionally OR'd with XPAD_CP_SHIFT. The
+ * chatpad sold internationally also prints accented letters and a few symbols
+ * (e.g. EUR, diaeresis) that have no Linux keycode; those are marked
+ * XPAD_CP_NONE and produce nothing. A zero entry means the key has no legend
+ * in that layer, so the base keycode is used instead (e.g. green + a digit
+ * still types the digit).
+ */
+#define XPAD_CP_SHIFT	0x8000		/* emit with Shift held */
+#define XPAD_CP_NONE	0x7fff		/* legend exists but is not representable */
+#define XPAD_CP_KEYMASK	0x0fff		/* keycode portion of an entry */
+
+static const u16 xpad_chatpad_green[128] = {
+	[0x27] = KEY_1 | XPAD_CP_SHIFT,		/* Q ! */
+	[0x26] = KEY_2 | XPAD_CP_SHIFT,		/* W @ */
+	[0x25] = XPAD_CP_NONE,			/* E EUR */
+	[0x24] = KEY_3 | XPAD_CP_SHIFT,		/* R # */
+	[0x23] = KEY_5 | XPAD_CP_SHIFT,		/* T % */
+	[0x22] = KEY_6 | XPAD_CP_SHIFT,		/* Y ^ */
+	[0x21] = KEY_7 | XPAD_CP_SHIFT,		/* U & */
+	[0x76] = KEY_8 | XPAD_CP_SHIFT,		/* I * */
+	[0x75] = KEY_9 | XPAD_CP_SHIFT,		/* O ( */
+	[0x64] = KEY_0 | XPAD_CP_SHIFT,		/* P ) */
+	[0x37] = KEY_GRAVE | XPAD_CP_SHIFT,	/* A ~ */
+	[0x36] = XPAD_CP_NONE,			/* S s-caron */
+	[0x35] = KEY_LEFTBRACE | XPAD_CP_SHIFT,	/* D { */
+	[0x34] = KEY_RIGHTBRACE | XPAD_CP_SHIFT,/* F } */
+	[0x33] = XPAD_CP_NONE,			/* G diaeresis */
+	[0x32] = KEY_SLASH,			/* H / */
+	[0x31] = KEY_APOSTROPHE,		/* J ' */
+	[0x77] = KEY_LEFTBRACE,			/* K [ */
+	[0x72] = KEY_RIGHTBRACE,		/* L ] */
+	[0x62] = KEY_SEMICOLON | XPAD_CP_SHIFT,	/* , : */
+	[0x46] = KEY_GRAVE,			/* Z ` */
+	[0x45] = XPAD_CP_NONE,			/* X << */
+	[0x44] = XPAD_CP_NONE,			/* C >> */
+	[0x43] = KEY_MINUS,			/* V - */
+	[0x42] = KEY_BACKSLASH | XPAD_CP_SHIFT,	/* B | */
+	[0x41] = KEY_COMMA | XPAD_CP_SHIFT,	/* N < */
+	[0x52] = KEY_DOT | XPAD_CP_SHIFT,	/* M > */
+	[0x53] = KEY_SLASH | XPAD_CP_SHIFT,	/* . ? */
+};
+
+static const u16 xpad_chatpad_orange[128] = {
+	[0x27] = XPAD_CP_NONE,			/* Q inverted-! */
+	[0x26] = XPAD_CP_NONE,			/* W a-ring */
+	[0x25] = XPAD_CP_NONE,			/* E e-acute */
+	[0x24] = KEY_4 | XPAD_CP_SHIFT,		/* R $ */
+	[0x23] = XPAD_CP_NONE,			/* T thorn */
+	[0x22] = XPAD_CP_NONE,			/* Y y-acute */
+	[0x21] = XPAD_CP_NONE,			/* U u-acute */
+	[0x76] = XPAD_CP_NONE,			/* I i-acute */
+	[0x75] = XPAD_CP_NONE,			/* O o-acute */
+	[0x64] = KEY_EQUAL,			/* P = */
+	[0x37] = XPAD_CP_NONE,			/* A a-acute */
+	[0x36] = XPAD_CP_NONE,			/* S sharp-s */
+	[0x35] = XPAD_CP_NONE,			/* D eth */
+	[0x34] = XPAD_CP_NONE,			/* F pound */
+	[0x33] = XPAD_CP_NONE,			/* G yen */
+	[0x32] = KEY_BACKSLASH,			/* H \ */
+	[0x31] = KEY_APOSTROPHE | XPAD_CP_SHIFT,/* J " */
+	[0x77] = XPAD_CP_NONE,			/* K smiley */
+	[0x72] = XPAD_CP_NONE,			/* L o-stroke */
+	[0x62] = KEY_SEMICOLON,			/* , ; */
+	[0x46] = XPAD_CP_NONE,			/* Z ae */
+	[0x45] = XPAD_CP_NONE,			/* X oe */
+	[0x44] = XPAD_CP_NONE,			/* C c-cedilla */
+	[0x43] = KEY_MINUS | XPAD_CP_SHIFT,	/* V _ */
+	[0x42] = KEY_EQUAL | XPAD_CP_SHIFT,	/* B + */
+	[0x41] = XPAD_CP_NONE,			/* N n-tilde */
+	[0x52] = XPAD_CP_NONE,			/* M micro */
+	[0x53] = XPAD_CP_NONE,			/* . inverted-? */
+};
+
 /* used for GHL dpad mapping */
 static const struct {int x; int y; } dpad_mapping[] = {
 	{0, -1}, {1, -1}, {1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1},
@@ -882,7 +960,11 @@ struct usb_xpad {
 	dma_addr_t chatpad_idata_dma;
 	struct delayed_work chatpad_keepalive;	/* periodic chatpad keep-alive */
 	bool chatpad_keepalive_toggle;	/* wired: alternate 0x1f / 0x1e */
-	u8 chatpad_laststroke[3];	/* last reported [modifier, key1, key2] */
+	u8 chatpad_held_sc[2];		/* physical scancodes currently held */
+	u16 chatpad_held_kc[2];		/* emitted keycode for each held key */
+	bool chatpad_shift;		/* synthetic Shift currently asserted */
+	bool chatpad_meta;		/* People (Meta) currently asserted */
+	u8 chatpad_last_mod;		/* last modifier byte (for LED sync) */
 	struct work_struct chatpad_led_work;	/* sync wired modifier LEDs */
 	u8 chatpad_led_state;		/* modifier LED bits currently in hw */
 	u8 chatpad_led_target;		/* desired modifier LED bits */
@@ -2368,19 +2450,94 @@ static void xpad_chatpad_led_work(struct work_struct *work)
 }
 
 /*
+ *	xpad_chatpad_resolve
+ *
+ *	Resolves a chatpad scancode to a Linux keycode for the currently
+ *	selected layer. Holding green or orange selects the symbol printed on
+ *	the keycap in that colour. The return value is a keycode, optionally
+ *	OR'd with XPAD_CP_SHIFT when the symbol lives on a shifted key, or 0
+ *	when nothing should be emitted (unmapped scancode, or an international
+ *	legend that has no Linux keycode).
+ */
+static u16 xpad_chatpad_resolve(u8 modifier, u8 scancode)
+{
+	u16 e = 0;
+
+	scancode &= 0x7f;
+
+	if (modifier & CHATPAD_MOD_GREEN)
+		e = xpad_chatpad_green[scancode];
+	else if (modifier & CHATPAD_MOD_ORANGE)
+		e = xpad_chatpad_orange[scancode];
+
+	if (e == XPAD_CP_NONE)
+		return 0;
+	if (e)
+		return e;
+
+	/* No legend in this layer: fall back to the base keycode. */
+	return xpad_chatpad_keycodes[scancode];
+}
+
+/*
+ *	xpad_chatpad_reset
+ *
+ *	Releases everything the chatpad input device currently holds. Used when
+ *	the wireless chatpad reports a wake-up (which implies all keys were
+ *	released) so that no key gets stuck down.
+ */
+static void xpad_chatpad_reset(struct usb_xpad *xpad)
+{
+	struct input_dev *dev = xpad->chatpad_dev;
+	bool sync = false;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		if (xpad->chatpad_held_sc[i]) {
+			if (dev)
+				input_report_key(dev, xpad->chatpad_held_kc[i], 0);
+			xpad->chatpad_held_sc[i] = 0;
+			xpad->chatpad_held_kc[i] = 0;
+			sync = true;
+		}
+	}
+	if (xpad->chatpad_shift) {
+		if (dev)
+			input_report_key(dev, KEY_LEFTSHIFT, 0);
+		xpad->chatpad_shift = false;
+		sync = true;
+	}
+	if (xpad->chatpad_meta) {
+		if (dev)
+			input_report_key(dev, KEY_LEFTMETA, 0);
+		xpad->chatpad_meta = false;
+		sync = true;
+	}
+
+	if (dev && sync)
+		input_sync(dev);
+}
+
+/*
  *	xpad_chatpad_report_keys
  *
  *	Converts a chatpad key report ([modifier][key1][key2]) into input
  *	events. The chatpad reports up to two simultaneous keys plus a set of
- *	modifier flags; releases are detected by diffing against the previously
- *	reported state. Shared by the wired and wireless code paths.
+ *	modifier flags. Green/orange select alternate symbol layers (with Shift
+ *	synthesized as needed); shift and people are exposed as Shift/Meta.
+ *	State is reconciled against the keys we previously emitted so that the
+ *	correct keycode is released even if the layer changed meanwhile.
+ *	Shared by the wired and wireless code paths.
  */
 static void xpad_chatpad_report_keys(struct usb_xpad *xpad,
 				     u8 modifier, u8 key1, u8 key2)
 {
 	struct input_dev *dev = xpad->chatpad_dev;
-	u8 *last = xpad->chatpad_laststroke;
-	u8 changed = modifier ^ last[0];
+	u8 raw[2] = { key1, key2 };
+	u8 newkeys[2];
+	u16 newcodes[2];
+	bool want_shift, want_meta;
+	int i, j, n = 0;
 
 	if (!dev)
 		return;
@@ -2390,35 +2547,88 @@ static void xpad_chatpad_report_keys(struct usb_xpad *xpad,
 	 * The actual LED commands are control transfers, so they are deferred
 	 * to a work item (this runs in the URB completion handler).
 	 */
-	if (xpad->xtype == XTYPE_XBOX360 && (changed & 0x0f)) {
+	if (xpad->xtype == XTYPE_XBOX360 &&
+	    (modifier & 0x0f) != xpad->chatpad_last_mod) {
 		xpad->chatpad_led_target = modifier & 0x0f;
 		schedule_work(&xpad->chatpad_led_work);
 	}
+	xpad->chatpad_last_mod = modifier & 0x0f;
 
-	if (changed & CHATPAD_MOD_SHIFT)
-		input_report_key(dev, KEY_LEFTSHIFT, modifier & CHATPAD_MOD_SHIFT);
-	if (changed & CHATPAD_MOD_GREEN)
-		input_report_key(dev, KEY_LEFTALT, modifier & CHATPAD_MOD_GREEN);
-	if (changed & CHATPAD_MOD_ORANGE)
-		input_report_key(dev, KEY_RIGHTALT, modifier & CHATPAD_MOD_ORANGE);
-	if (changed & CHATPAD_MOD_PEOPLE)
-		input_report_key(dev, KEY_LEFTMETA, modifier & CHATPAD_MOD_PEOPLE);
+	want_meta = !!(modifier & CHATPAD_MOD_PEOPLE);
+	want_shift = !!(modifier & CHATPAD_MOD_SHIFT);
 
-	/* keys that were held but are no longer present have been released */
-	if (last[1] && last[1] != key1 && last[1] != key2)
-		input_report_key(dev, xpad_chatpad_keycodes[last[1] & 0x7f], 0);
-	if (last[2] && last[2] != key1 && last[2] != key2)
-		input_report_key(dev, xpad_chatpad_keycodes[last[2] & 0x7f], 0);
+	/* Resolve the up-to-two pressed keys for the active layer */
+	for (i = 0; i < 2; i++) {
+		u16 e;
 
-	/* keys that are newly present have been pressed */
-	if (key1 && key1 != last[1] && key1 != last[2])
-		input_report_key(dev, xpad_chatpad_keycodes[key1 & 0x7f], 1);
-	if (key2 && key2 != last[1] && key2 != last[2])
-		input_report_key(dev, xpad_chatpad_keycodes[key2 & 0x7f], 1);
+		if (!raw[i])
+			continue;
+		e = xpad_chatpad_resolve(modifier, raw[i]);
+		if (!e)
+			continue;
+		newkeys[n] = raw[i];
+		newcodes[n] = e & XPAD_CP_KEYMASK;
+		if (e & XPAD_CP_SHIFT)
+			want_shift = true;
+		n++;
+	}
 
-	last[0] = modifier;
-	last[1] = key1;
-	last[2] = key2;
+	/* Assert Shift/Meta before pressing keys */
+	if (want_shift && !xpad->chatpad_shift) {
+		input_report_key(dev, KEY_LEFTSHIFT, 1);
+		xpad->chatpad_shift = true;
+	}
+	if (want_meta && !xpad->chatpad_meta) {
+		input_report_key(dev, KEY_LEFTMETA, 1);
+		xpad->chatpad_meta = true;
+	}
+
+	/* Release physical keys that are no longer held */
+	for (i = 0; i < 2; i++) {
+		u8 sc = xpad->chatpad_held_sc[i];
+		bool held = false;
+
+		if (!sc)
+			continue;
+		for (j = 0; j < n; j++)
+			if (newkeys[j] == sc)
+				held = true;
+		if (!held) {
+			input_report_key(dev, xpad->chatpad_held_kc[i], 0);
+			xpad->chatpad_held_sc[i] = 0;
+			xpad->chatpad_held_kc[i] = 0;
+		}
+	}
+
+	/* Press physical keys that are newly held */
+	for (j = 0; j < n; j++) {
+		bool already = false;
+
+		for (i = 0; i < 2; i++)
+			if (xpad->chatpad_held_sc[i] == newkeys[j])
+				already = true;
+		if (already)
+			continue;
+		for (i = 0; i < 2; i++) {
+			if (!xpad->chatpad_held_sc[i]) {
+				xpad->chatpad_held_sc[i] = newkeys[j];
+				xpad->chatpad_held_kc[i] = newcodes[j];
+				input_report_key(dev, newcodes[j], 1);
+				break;
+			}
+		}
+	}
+
+	/* Release Shift/Meta once they are no longer needed */
+	if (!want_shift && xpad->chatpad_shift) {
+		input_report_key(dev, KEY_LEFTSHIFT, 0);
+		xpad->chatpad_shift = false;
+	}
+	if (!want_meta && xpad->chatpad_meta) {
+		input_report_key(dev, KEY_LEFTMETA, 0);
+		xpad->chatpad_meta = false;
+	}
+
 	input_sync(dev);
 }
 
@@ -2463,9 +2673,7 @@ static void xpad360w_chatpad_process(struct usb_xpad *xpad, unsigned char *data)
 	case 0xf0:
 		/* 0xf0 0x03 means the chatpad just woke up; ack it */
 		if (data[25] == 0x03) {
-			xpad->chatpad_laststroke[0] = 0;
-			xpad->chatpad_laststroke[1] = 0;
-			xpad->chatpad_laststroke[2] = 0;
+			xpad_chatpad_reset(xpad);
 			xpad_chatpad_wireless_send(xpad, 0x1b);
 		}
 		break;
@@ -2613,14 +2821,20 @@ static int xpad_chatpad_init_input(struct usb_xpad *xpad)
 	usb_to_input_id(xpad->udev, &input->id);
 	input->dev.parent = &xpad->intf->dev;
 
-	for (i = 0; i < ARRAY_SIZE(xpad_chatpad_keycodes); i++)
+	/* Advertise every keycode reachable through the base/green/orange layers */
+	for (i = 0; i < ARRAY_SIZE(xpad_chatpad_keycodes); i++) {
 		if (xpad_chatpad_keycodes[i])
 			input_set_capability(input, EV_KEY,
 					     xpad_chatpad_keycodes[i]);
+		if (xpad_chatpad_green[i] && xpad_chatpad_green[i] != XPAD_CP_NONE)
+			input_set_capability(input, EV_KEY,
+					     xpad_chatpad_green[i] & XPAD_CP_KEYMASK);
+		if (xpad_chatpad_orange[i] && xpad_chatpad_orange[i] != XPAD_CP_NONE)
+			input_set_capability(input, EV_KEY,
+					     xpad_chatpad_orange[i] & XPAD_CP_KEYMASK);
+	}
 
 	input_set_capability(input, EV_KEY, KEY_LEFTSHIFT);
-	input_set_capability(input, EV_KEY, KEY_LEFTALT);
-	input_set_capability(input, EV_KEY, KEY_RIGHTALT);
 	input_set_capability(input, EV_KEY, KEY_LEFTMETA);
 
 	error = input_register_device(input);
@@ -2629,7 +2843,11 @@ static int xpad_chatpad_init_input(struct usb_xpad *xpad)
 		return error;
 	}
 
-	memset(xpad->chatpad_laststroke, 0, sizeof(xpad->chatpad_laststroke));
+	memset(xpad->chatpad_held_sc, 0, sizeof(xpad->chatpad_held_sc));
+	memset(xpad->chatpad_held_kc, 0, sizeof(xpad->chatpad_held_kc));
+	xpad->chatpad_shift = false;
+	xpad->chatpad_meta = false;
+	xpad->chatpad_last_mod = 0;
 	xpad->chatpad_dev = input;
 	return 0;
 }

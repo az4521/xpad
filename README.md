@@ -13,9 +13,14 @@ This driver includes the latest changes in the upstream linux kernel and additio
 ## Xbox 360 Chatpad
 The Chatpad is the small QWERTY keyboard that clips onto an Xbox 360 controller.
 When attached it shows up as an additional keyboard input device named
-"<controller> Chatpad" and reports normal key events. The green/orange/shift/
-people modifier keys are reported as Alt/AltGr/Shift/Meta respectively, so they
-can be remapped from userspace if desired.
+"<controller> Chatpad" and reports normal key events.
+
+The **green** and **orange** keys act as symbol layers: holding one and pressing
+a key types the symbol printed on the keycap in that colour (Shift is
+synthesized automatically for symbols such as `!` or `{`). Symbols that have no
+Linux keycode — the accented letters and a few others (`€`, `¨`, `«`, `»`,
+etc.) printed on the international Chatpad — are ignored. **Shift** works as
+usual and the **people** key is reported as Meta (Super).
 
 Chatpad support is enabled by default; it can be disabled with the `chatpad=0`
 module parameter:
