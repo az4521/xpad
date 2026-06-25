@@ -2387,10 +2387,19 @@ static void xpad_deinit_input(struct usb_xpad *xpad)
 }
 
 /*
+ * The modifier LEDs, ordered to match the hardware command byte: the LED
+ * command value is the index for "off" and 0x08 | index for "on". This is
+ * also the bit order used in chatpad_led_target / chatpad_led_state.
+ */
+static const u8 xpad_chatpad_mod_bits[] = {
+	CHATPAD_MOD_SHIFT, CHATPAD_MOD_GREEN, CHATPAD_MOD_ORANGE, CHATPAD_MOD_PEOPLE,
+};
+
+/*
  *	xpad_chatpad_set_led
  *
- *	Turns one of the chatpad's modifier backlight LEDs on or off. Must be
- *	called from a sleepable context.
+ *	Turns one of the chatpad's modifier backlight LEDs (by index into
+ *	xpad_chatpad_mod_bits) on or off. Must be called from a sleepable context.
  *
  *	On wired controllers the LED is a control transfer. On wireless ones the
  *	same command byte is carried by the command OUT endpoint (the channel the
@@ -2398,26 +2407,9 @@ static void xpad_deinit_input(struct usb_xpad *xpad)
  *	wireless LED command isn't publicly documented; it was found by matching
  *	the wired command byte to the wireless command channel.
  */
-static void xpad_chatpad_set_led(struct usb_xpad *xpad, u8 mod, bool on)
+static void xpad_chatpad_set_led(struct usb_xpad *xpad, unsigned int led, bool on)
 {
-	u16 value;
-
-	switch (mod) {
-	case CHATPAD_MOD_SHIFT:
-		value = on ? 0x0008 : 0x0000;
-		break;
-	case CHATPAD_MOD_GREEN:
-		value = on ? 0x0009 : 0x0001;
-		break;
-	case CHATPAD_MOD_ORANGE:
-		value = on ? 0x000a : 0x0002;
-		break;
-	case CHATPAD_MOD_PEOPLE:
-		value = on ? 0x000b : 0x0003;
-		break;
-	default:
-		return;
-	}
+	u16 value = led | (on ? 0x08 : 0x00);
 
 	if (xpad->xtype == XTYPE_XBOX360W)
 		xpad_chatpad_wireless_send(xpad, value);
@@ -2439,23 +2431,16 @@ static void xpad_chatpad_led_work(struct work_struct *work)
 	struct usb_xpad *xpad =
 		container_of(work, struct usb_xpad, chatpad_led_work);
 	u8 target, changed;
+	unsigned int i;
 
 	do {
 		target = READ_ONCE(xpad->chatpad_led_target);
 		changed = target ^ xpad->chatpad_led_state;
 
-		if (changed & CHATPAD_MOD_SHIFT)
-			xpad_chatpad_set_led(xpad, CHATPAD_MOD_SHIFT,
-					     target & CHATPAD_MOD_SHIFT);
-		if (changed & CHATPAD_MOD_GREEN)
-			xpad_chatpad_set_led(xpad, CHATPAD_MOD_GREEN,
-					     target & CHATPAD_MOD_GREEN);
-		if (changed & CHATPAD_MOD_ORANGE)
-			xpad_chatpad_set_led(xpad, CHATPAD_MOD_ORANGE,
-					     target & CHATPAD_MOD_ORANGE);
-		if (changed & CHATPAD_MOD_PEOPLE)
-			xpad_chatpad_set_led(xpad, CHATPAD_MOD_PEOPLE,
-					     target & CHATPAD_MOD_PEOPLE);
+		for (i = 0; i < ARRAY_SIZE(xpad_chatpad_mod_bits); i++)
+			if (changed & xpad_chatpad_mod_bits[i])
+				xpad_chatpad_set_led(xpad, i,
+						     target & xpad_chatpad_mod_bits[i]);
 
 		xpad->chatpad_led_state = target;
 	} while (target != READ_ONCE(xpad->chatpad_led_target));
@@ -2573,6 +2558,16 @@ static void xpad_chatpad_reset(struct usb_xpad *xpad)
 		input_sync(dev);
 }
 
+/* Press or release a synthesized modifier key, tracking its current state. */
+static void xpad_chatpad_hold(struct input_dev *dev, unsigned int key,
+			      bool *held, bool want)
+{
+	if (*held != want) {
+		input_report_key(dev, key, want);
+		*held = want;
+	}
+}
+
 /*
  *	xpad_chatpad_report_keys
  *
@@ -2639,15 +2634,14 @@ static void xpad_chatpad_report_keys(struct usb_xpad *xpad,
 		n++;
 	}
 
-	/* Assert Shift/Meta before pressing keys */
-	if (want_shift && !xpad->chatpad_shift) {
-		input_report_key(dev, KEY_LEFTSHIFT, 1);
-		xpad->chatpad_shift = true;
-	}
-	if (want_meta && !xpad->chatpad_meta) {
-		input_report_key(dev, KEY_LEFTMETA, 1);
-		xpad->chatpad_meta = true;
-	}
+	/*
+	 * Reconcile Shift/Meta here, before the keys: a key-down must see the
+	 * right modifier state, and a key-up never produces a character, so
+	 * doing both directions at this point (all within the one input_sync
+	 * frame below) is correct.
+	 */
+	xpad_chatpad_hold(dev, KEY_LEFTSHIFT, &xpad->chatpad_shift, want_shift);
+	xpad_chatpad_hold(dev, KEY_LEFTMETA, &xpad->chatpad_meta, want_meta);
 
 	/* Release physical keys that are no longer held */
 	for (i = 0; i < 2; i++) {
@@ -2683,16 +2677,6 @@ static void xpad_chatpad_report_keys(struct usb_xpad *xpad,
 				break;
 			}
 		}
-	}
-
-	/* Release Shift/Meta once they are no longer needed */
-	if (!want_shift && xpad->chatpad_shift) {
-		input_report_key(dev, KEY_LEFTSHIFT, 0);
-		xpad->chatpad_shift = false;
-	}
-	if (!want_meta && xpad->chatpad_meta) {
-		input_report_key(dev, KEY_LEFTMETA, 0);
-		xpad->chatpad_meta = false;
 	}
 
 	input_sync(dev);
