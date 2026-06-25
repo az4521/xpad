@@ -2396,26 +2396,33 @@ static const u8 xpad_chatpad_mod_bits[] = {
 };
 
 /*
+ *	xpad_chatpad_send_cmd
+ *
+ *	Sends a chatpad control command byte over whichever transport this
+ *	controller uses. The same command bytes (enable/keep-alive 0x1b/0x1e/0x1f
+ *	and the LED values 0x00-0x0b) work on both transports: wired delivers them
+ *	as a control transfer, wireless wraps them in a 00 00 0c <cmd> packet on
+ *	the command endpoint. (The wireless mapping isn't publicly documented; it
+ *	was found by matching the wired command byte to the wireless channel.)
+ */
+static void xpad_chatpad_send_cmd(struct usb_xpad *xpad, u8 cmd)
+{
+	if (xpad->xtype == XTYPE_XBOX360W)
+		xpad_chatpad_wireless_send(xpad, cmd);
+	else
+		usb_control_msg_send(xpad->udev, 0, 0x00, 0x41, cmd, 0x0002,
+				     NULL, 0, 100, GFP_KERNEL);
+}
+
+/*
  *	xpad_chatpad_set_led
  *
  *	Turns one of the chatpad's modifier backlight LEDs (by index into
  *	xpad_chatpad_mod_bits) on or off. Must be called from a sleepable context.
- *
- *	On wired controllers the LED is a control transfer. On wireless ones the
- *	same command byte is carried by the command OUT endpoint (the channel the
- *	enable/keep-alive uses), so we wrap it in a 00 00 0c <value> packet. The
- *	wireless LED command isn't publicly documented; it was found by matching
- *	the wired command byte to the wireless command channel.
  */
 static void xpad_chatpad_set_led(struct usb_xpad *xpad, unsigned int led, bool on)
 {
-	u16 value = led | (on ? 0x08 : 0x00);
-
-	if (xpad->xtype == XTYPE_XBOX360W)
-		xpad_chatpad_wireless_send(xpad, value);
-	else
-		usb_control_msg_send(xpad->udev, 0, 0x00, 0x41, value, 0x0002,
-				     NULL, 0, 100, GFP_KERNEL);
+	xpad_chatpad_send_cmd(xpad, led | (on ? 0x08 : 0x00));
 }
 
 /*
@@ -2824,24 +2831,21 @@ static int xpad_chatpad_send_init(struct usb_xpad *xpad)
  *	xpad_chatpad_keepalive_work
  *
  *	The chatpad falls asleep after a few seconds unless it is regularly
- *	poked. Wired controllers expect alternating 0x1f / 0x1e control
- *	transfers, wireless controllers expect a 0x1f command on the OUT
- *	endpoint.
+ *	poked. Wired controllers expect alternating 0x1f / 0x1e pokes, wireless
+ *	controllers just want 0x1f.
  */
 static void xpad_chatpad_keepalive_work(struct work_struct *work)
 {
 	struct usb_xpad *xpad = container_of(to_delayed_work(work),
 					     struct usb_xpad, chatpad_keepalive);
+	u8 cmd = 0x1f;
 
 	if (xpad->xtype == XTYPE_XBOX360) {
-		u16 cmd = xpad->chatpad_keepalive_toggle ? 0x1e : 0x1f;
-
+		cmd = xpad->chatpad_keepalive_toggle ? 0x1e : 0x1f;
 		xpad->chatpad_keepalive_toggle = !xpad->chatpad_keepalive_toggle;
-		usb_control_msg_send(xpad->udev, 0, 0x00, 0x41, cmd, 0x02,
-				     NULL, 0, 100, GFP_KERNEL);
-	} else if (xpad->xtype == XTYPE_XBOX360W) {
-		xpad_chatpad_wireless_send(xpad, 0x1f);
 	}
+
+	xpad_chatpad_send_cmd(xpad, cmd);
 
 	schedule_delayed_work(&xpad->chatpad_keepalive,
 			      msecs_to_jiffies(CHATPAD_KEEPALIVE_INTERVAL));
