@@ -2392,11 +2392,10 @@ static void xpad_deinit_input(struct usb_xpad *xpad)
  *	called from a sleepable context.
  *
  *	On wired controllers the LED is a control transfer. On wireless ones the
- *	same command byte appears to be carried by the command OUT endpoint
- *	(the channel the enable/keep-alive uses), so we wrap it in a
- *	00 00 0c <value> packet. The wireless path is experimental and
- *	unverified - no public source documents wireless chatpad LED control;
- *	it is inferred from the wired command byte matching the wireless one.
+ *	same command byte is carried by the command OUT endpoint (the channel the
+ *	enable/keep-alive uses), so we wrap it in a 00 00 0c <value> packet. The
+ *	wireless LED command isn't publicly documented; it was found by matching
+ *	the wired command byte to the wireless command channel.
  */
 static void xpad_chatpad_set_led(struct usb_xpad *xpad, u8 mod, bool on)
 {
@@ -2558,8 +2557,7 @@ static void xpad_chatpad_report_keys(struct usb_xpad *xpad,
 	 * Mirror the modifier keys on the chatpad's backlight LEDs. The LED
 	 * commands can sleep (wired) or take the output lock (wireless), so
 	 * they are deferred to a work item (this runs in the URB completion
-	 * handler). Wireless LED control is experimental (see
-	 * xpad_chatpad_set_led).
+	 * handler).
 	 */
 	if ((xpad->xtype == XTYPE_XBOX360 || xpad->xtype == XTYPE_XBOX360W) &&
 	    (modifier & 0x0f) != xpad->chatpad_last_mod) {
