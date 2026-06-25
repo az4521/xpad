@@ -965,6 +965,7 @@ struct usb_xpad {
 	bool chatpad_shift;		/* synthetic Shift currently asserted */
 	bool chatpad_meta;		/* People (Meta) currently asserted */
 	u8 chatpad_last_mod;		/* last modifier byte (for LED sync) */
+	bool chatpad_capslock;		/* system caps lock state (from EV_LED) */
 	struct work_struct chatpad_led_work;	/* sync chatpad modifier LEDs */
 	u8 chatpad_led_state;		/* modifier LED bits currently in hw */
 	u8 chatpad_led_target;		/* desired modifier LED bits */
@@ -2461,6 +2462,49 @@ static void xpad_chatpad_led_work(struct work_struct *work)
 }
 
 /*
+ *	xpad_chatpad_update_leds
+ *
+ *	Computes the desired modifier-LED state and kicks the LED work if it
+ *	changed. The shift LED tracks the held shift modifier and, additionally,
+ *	stays lit while system caps lock is on, turning it into a caps-lock
+ *	indicator. Safe to call from atomic context.
+ */
+static void xpad_chatpad_update_leds(struct usb_xpad *xpad, u8 modifier)
+{
+	u8 target = modifier & 0x0f;
+
+	if (xpad->chatpad_capslock)
+		target |= CHATPAD_MOD_SHIFT;
+
+	if (target != READ_ONCE(xpad->chatpad_led_target)) {
+		WRITE_ONCE(xpad->chatpad_led_target, target);
+		schedule_work(&xpad->chatpad_led_work);
+	}
+}
+
+/*
+ *	xpad_chatpad_event
+ *
+ *	Input core callback used to push LED state to the device. We use it to
+ *	learn the real system caps-lock state (driven by libinput/console on any
+ *	keyboard) and mirror it onto the shift backlight. Runs in atomic context.
+ */
+static int xpad_chatpad_event(struct input_dev *dev, unsigned int type,
+			      unsigned int code, int value)
+{
+	struct usb_xpad *xpad = input_get_drvdata(dev);
+
+	if (type == EV_LED && code == LED_CAPSL) {
+		xpad->chatpad_capslock = value;
+		if (xpad->xtype == XTYPE_XBOX360 ||
+		    xpad->xtype == XTYPE_XBOX360W)
+			xpad_chatpad_update_leds(xpad, xpad->chatpad_last_mod);
+	}
+
+	return 0;
+}
+
+/*
  *	xpad_chatpad_resolve
  *
  *	Resolves a chatpad scancode to a Linux keycode for the currently
@@ -2554,16 +2598,26 @@ static void xpad_chatpad_report_keys(struct usb_xpad *xpad,
 		return;
 
 	/*
-	 * Mirror the modifier keys on the chatpad's backlight LEDs. The LED
-	 * commands can sleep (wired) or take the output lock (wireless), so
-	 * they are deferred to a work item (this runs in the URB completion
-	 * handler).
+	 * Orange+Shift is the "CAPS" legend on the shift key. On the rising
+	 * edge of that combination, tap Caps Lock so userspace toggles it.
 	 */
-	if ((xpad->xtype == XTYPE_XBOX360 || xpad->xtype == XTYPE_XBOX360W) &&
-	    (modifier & 0x0f) != xpad->chatpad_last_mod) {
-		xpad->chatpad_led_target = modifier & 0x0f;
-		schedule_work(&xpad->chatpad_led_work);
+	if ((modifier & (CHATPAD_MOD_ORANGE | CHATPAD_MOD_SHIFT)) ==
+		(CHATPAD_MOD_ORANGE | CHATPAD_MOD_SHIFT) &&
+	    (xpad->chatpad_last_mod & (CHATPAD_MOD_ORANGE | CHATPAD_MOD_SHIFT)) !=
+		(CHATPAD_MOD_ORANGE | CHATPAD_MOD_SHIFT)) {
+		input_report_key(dev, KEY_CAPSLOCK, 1);
+		input_sync(dev);
+		input_report_key(dev, KEY_CAPSLOCK, 0);
+		input_sync(dev);
 	}
+
+	/*
+	 * Mirror the modifier keys (and caps lock) on the chatpad's backlight
+	 * LEDs. The LED commands can sleep (wired) or take the output lock
+	 * (wireless), so they are deferred to a work item.
+	 */
+	if (xpad->xtype == XTYPE_XBOX360 || xpad->xtype == XTYPE_XBOX360W)
+		xpad_chatpad_update_leds(xpad, modifier);
 	xpad->chatpad_last_mod = modifier & 0x0f;
 
 	want_meta = !!(modifier & CHATPAD_MOD_PEOPLE);
@@ -2832,6 +2886,8 @@ static int xpad_chatpad_init_input(struct usb_xpad *xpad)
 	input->phys = xpad->chatpad_phys;
 	usb_to_input_id(xpad->udev, &input->id);
 	input->dev.parent = &xpad->intf->dev;
+	input->event = xpad_chatpad_event;
+	input_set_drvdata(input, xpad);
 
 	/* Advertise every keycode reachable through the base/green/orange layers */
 	for (i = 0; i < ARRAY_SIZE(xpad_chatpad_keycodes); i++) {
@@ -2848,6 +2904,10 @@ static int xpad_chatpad_init_input(struct usb_xpad *xpad)
 
 	input_set_capability(input, EV_KEY, KEY_LEFTSHIFT);
 	input_set_capability(input, EV_KEY, KEY_LEFTMETA);
+	input_set_capability(input, EV_KEY, KEY_CAPSLOCK);
+
+	/* Receive caps-lock LED state so the shift backlight can mirror it */
+	input_set_capability(input, EV_LED, LED_CAPSL);
 
 	error = input_register_device(input);
 	if (error) {
@@ -2860,6 +2920,7 @@ static int xpad_chatpad_init_input(struct usb_xpad *xpad)
 	xpad->chatpad_shift = false;
 	xpad->chatpad_meta = false;
 	xpad->chatpad_last_mod = 0;
+	xpad->chatpad_capslock = false;
 	xpad->chatpad_dev = input;
 	return 0;
 }
