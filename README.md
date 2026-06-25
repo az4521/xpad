@@ -22,6 +22,10 @@ Linux keycode — the accented letters and a few others (`€`, `¨`, `«`, `»`
 etc.) printed on the international Chatpad — are ignored. **Shift** works as
 usual and the **people** key is reported as Meta (Super).
 
+While a modifier is held, its backlight LED on the Chatpad lights up. This is
+confirmed on wired controllers; on wireless controllers it is experimental
+(the LED command is inferred, not documented) and may not work.
+
 Chatpad support is enabled by default; it can be disabled with the `chatpad=0`
 module parameter:
 ```

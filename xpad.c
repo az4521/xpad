@@ -965,7 +965,7 @@ struct usb_xpad {
 	bool chatpad_shift;		/* synthetic Shift currently asserted */
 	bool chatpad_meta;		/* People (Meta) currently asserted */
 	u8 chatpad_last_mod;		/* last modifier byte (for LED sync) */
-	struct work_struct chatpad_led_work;	/* sync wired modifier LEDs */
+	struct work_struct chatpad_led_work;	/* sync chatpad modifier LEDs */
 	u8 chatpad_led_state;		/* modifier LED bits currently in hw */
 	u8 chatpad_led_target;		/* desired modifier LED bits */
 	char chatpad_name[128];		/* chatpad input device name */
@@ -980,6 +980,7 @@ static struct usb_driver xpad_driver;
 static int xpad_chatpad_init_input(struct usb_xpad *xpad);
 static void xpad_chatpad_deinit_input(struct usb_xpad *xpad);
 static void xpad360w_chatpad_process(struct usb_xpad *xpad, unsigned char *data);
+static void xpad_chatpad_wireless_send(struct usb_xpad *xpad, u8 cmd);
 
 /*
  *	ghl_magic_poke_cb
@@ -2387,8 +2388,15 @@ static void xpad_deinit_input(struct usb_xpad *xpad)
 /*
  *	xpad_chatpad_set_led
  *
- *	Turns one of the wired chatpad's modifier backlight LEDs on or off via
- *	a control transfer. Must be called from a sleepable context.
+ *	Turns one of the chatpad's modifier backlight LEDs on or off. Must be
+ *	called from a sleepable context.
+ *
+ *	On wired controllers the LED is a control transfer. On wireless ones the
+ *	same command byte appears to be carried by the command OUT endpoint
+ *	(the channel the enable/keep-alive uses), so we wrap it in a
+ *	00 00 0c <value> packet. The wireless path is experimental and
+ *	unverified - no public source documents wireless chatpad LED control;
+ *	it is inferred from the wired command byte matching the wireless one.
  */
 static void xpad_chatpad_set_led(struct usb_xpad *xpad, u8 mod, bool on)
 {
@@ -2411,16 +2419,20 @@ static void xpad_chatpad_set_led(struct usb_xpad *xpad, u8 mod, bool on)
 		return;
 	}
 
-	usb_control_msg_send(xpad->udev, 0, 0x00, 0x41, value, 0x0002,
-			     NULL, 0, 100, GFP_KERNEL);
+	if (xpad->xtype == XTYPE_XBOX360W)
+		xpad_chatpad_wireless_send(xpad, value);
+	else
+		usb_control_msg_send(xpad->udev, 0, 0x00, 0x41, value, 0x0002,
+				     NULL, 0, 100, GFP_KERNEL);
 }
 
 /*
  *	xpad_chatpad_led_work
  *
- *	The modifier LEDs are driven by control transfers, which cannot be
- *	issued from the URB completion handler that detects key state changes.
- *	This work brings the hardware LEDs in line with the requested state.
+ *	The modifier LEDs are driven by commands that can sleep (wired control
+ *	transfers) or take the output lock (wireless), neither of which is safe
+ *	from the URB completion handler that detects key state changes. This
+ *	work brings the hardware LEDs in line with the requested state.
  */
 static void xpad_chatpad_led_work(struct work_struct *work)
 {
@@ -2543,11 +2555,13 @@ static void xpad_chatpad_report_keys(struct usb_xpad *xpad,
 		return;
 
 	/*
-	 * Mirror the modifier keys on the wired chatpad's backlight LEDs.
-	 * The actual LED commands are control transfers, so they are deferred
-	 * to a work item (this runs in the URB completion handler).
+	 * Mirror the modifier keys on the chatpad's backlight LEDs. The LED
+	 * commands can sleep (wired) or take the output lock (wireless), so
+	 * they are deferred to a work item (this runs in the URB completion
+	 * handler). Wireless LED control is experimental (see
+	 * xpad_chatpad_set_led).
 	 */
-	if (xpad->xtype == XTYPE_XBOX360 &&
+	if ((xpad->xtype == XTYPE_XBOX360 || xpad->xtype == XTYPE_XBOX360W) &&
 	    (modifier & 0x0f) != xpad->chatpad_last_mod) {
 		xpad->chatpad_led_target = modifier & 0x0f;
 		schedule_work(&xpad->chatpad_led_work);
@@ -3005,11 +3019,10 @@ static void xpad_chatpad_stop(struct usb_xpad *xpad)
 		return;
 
 	cancel_delayed_work_sync(&xpad->chatpad_keepalive);
+	cancel_work_sync(&xpad->chatpad_led_work);
 
-	if (xpad->xtype == XTYPE_XBOX360) {
-		cancel_work_sync(&xpad->chatpad_led_work);
+	if (xpad->xtype == XTYPE_XBOX360)
 		xpad_chatpad_deinit_wired(xpad);
-	}
 
 	xpad_chatpad_deinit_input(xpad);
 }
@@ -3398,8 +3411,7 @@ static int xpad_suspend(struct usb_interface *intf, pm_message_t message)
 
 	if (xpad->chatpad) {
 		cancel_delayed_work_sync(&xpad->chatpad_keepalive);
-		if (xpad->xtype == XTYPE_XBOX360)
-			cancel_work_sync(&xpad->chatpad_led_work);
+		cancel_work_sync(&xpad->chatpad_led_work);
 		if (xpad->chatpad_irq_in)
 			usb_kill_urb(xpad->chatpad_irq_in);
 	}
@@ -3445,13 +3457,13 @@ static int xpad_resume(struct usb_interface *intf)
 	input = xpad->dev;
 
 	if (xpad->chatpad) {
-		/* re-run the enable handshake; the controller may have reset */
+		/* re-run the wired enable handshake; the controller may have reset */
 		if (xpad->chatpad_irq_in) {
 			xpad_chatpad_send_init(xpad);
 			usb_submit_urb(xpad->chatpad_irq_in, GFP_KERNEL);
-			/* hardware LEDs are off after a reset; re-sync lazily */
-			xpad->chatpad_led_state = 0;
 		}
+		/* hardware LEDs are off after a reset; re-sync lazily */
+		xpad->chatpad_led_state = 0;
 		schedule_delayed_work(&xpad->chatpad_keepalive,
 				      msecs_to_jiffies(CHATPAD_KEEPALIVE_INTERVAL));
 	}
